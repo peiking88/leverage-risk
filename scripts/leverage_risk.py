@@ -6,9 +6,10 @@
   融资余额 (动态, 交易所接口可靠):
     - 按板块: stock_margin_detail_szse / stock_margin_detail_sse (按代码前缀拆分)
     - 沪深合计: stock_margin_sse / stock_margin_szse (交易所汇总口径)
-  流通市值 (官方参考值, 无可靠实时接口):
-    - 深市板块流通市值无可靠实时接口 (stock_szse_summary 板块拆分约为真实值一半, 不可信;
-      stock_zh_a_spot_em 部分环境被墙), 故采用官方参考值, 可通过 --xxx-mv 覆盖, 建议定期更新。
+  流通市值 (交易所官方接口实时获取, 失败回退 REFERENCE_MV):
+    - 沪: stock_sse_summary (主板/科创板/合计, 单位亿元)
+    - 深: stock_szse_summary(date=) (创业板/合计, 单位元; 必须带 date, 无参返回异常子集)
+    - T 日收盘即有 (比融资余额 T+1 更新), 失败回退 REFERENCE_MV, 可用 --xxx-mv 覆盖。
   个股流通市值: stock_individual_info_em (东方财富, 被墙时显示 N/A)
 
 风险阈值: 融资余额 / 流通市值 > 4% 触发警示
@@ -24,26 +25,28 @@
 
 import argparse
 import json
+import sys
 import time
 from datetime import datetime, timedelta
 
 import akshare as ak
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
 # 默认监测标的集: 创业板 + 科创板 + 沪深两市合计
 DEFAULT_SEGMENTS = ["创业板", "科创板", "沪深两市"]
 
-# 流通市值参考表 (亿元) — 官方口径
-# 2026-07-17 验证: 创业板4.3% / 科创板3.4% / 沪深两市2.90%
-# 注意: 流通市值随行情变动, 建议每月/季更新或用 --xxx-mv 传入最新值
+# 流通市值参考表 (亿元) — 官方口径, 作为实时接口失败时的回退值
+# 正常 fetch_live_mv() 从沪深交易所官方接口实时获取; 此表仅在接口异常时兜底。
+# 2026-07-17 验证基线: 创业板4.3% / 科创板3.4% / 沪深两市2.90%
+# 注意: 流通市值随行情变动, 建议每季更新或用 --xxx-mv 传入最新值
 REFERENCE_MV = {
     "date": "20260717",
     "创业板": 144934.15,
     "科创板": 107381.71,
-    "沪深两市": 948326.0,   # A股流通市值 (融资余额27491.45亿 ÷ 2.90%)
+    "沪深两市": 948326.0,
 }
 
 
@@ -75,10 +78,18 @@ def resolve_date(date_str: str | None) -> str:
 
 # ---- 融资余额 (动态) ----
 def fetch_details(date_str: str):
-    """拉取沪深融资融券明细 (各调用一次)。"""
-    sz = ak.stock_margin_detail_szse(date=date_str)
-    time.sleep(1)
-    sh = ak.stock_margin_detail_sse(date=date_str)
+    """拉取沪深融资融券明细 (各调用一次)。数据未发布时 sse 接口返回空表会内部抛
+    ValueError, szse 返回空 DataFrame; 统一检测并转译为友好提示 (T+1 公布)。"""
+    msg = (f"日期 {date_str} 融资融券数据未发布 (T+1 公布: 非交易日, 或当日数据次日才更新)。"
+           f"建议省略 --date 自动取最近有数据交易日, 或改用更早日期。")
+    try:
+        sz = ak.stock_margin_detail_szse(date=date_str)
+        time.sleep(1)
+        sh = ak.stock_margin_detail_sse(date=date_str)
+    except ValueError as e:
+        raise ValueError(msg) from e
+    if sz.empty or sh.empty:
+        raise ValueError(msg)
     return sz, sh
 
 
@@ -122,6 +133,26 @@ def mv_for_symbol(code: str) -> float | None:
         return None
 
 
+def fetch_live_mv() -> dict | None:
+    """实时获取板块流通市值(亿元) — 沪深交易所官方接口, T 日收盘即有 (比融资余额 T+1 更新)。
+    沪: stock_sse_summary (单位亿元, 最新交易日, 含主板/科创板/股票合计)
+    深: stock_szse_summary(date=) (单位元, 必须带 date; 无参返回异常子集, 勿用)
+    返回 {板块: 亿元, 'date': 数据日期}; 任一接口失败返回 None (调用方回退 REFERENCE_MV)。"""
+    try:
+        sse = ak.stock_sse_summary().set_index("项目")
+        sh_total = float(sse.loc["流通市值", "股票"])           # 亿元
+        kcb = float(sse.loc["流通市值", "科创板"])
+        mv_date = str(int(float(sse.loc["报告时间", "股票"])))  # 兼容 "20260721" / 20260721.0
+        time.sleep(1)
+        sz = ak.stock_szse_summary(date=mv_date).set_index("证券类别")["流通市值"]  # 元
+        cyb = float(sz["创业板A股"]) / 1e8
+        sz_total = float(sz["股票"]) / 1e8
+        return {"创业板": cyb, "科创板": kcb,
+                "沪深两市": sh_total + sz_total, "date": mv_date}
+    except Exception:
+        return None
+
+
 # ---- 标的解析 ----
 def parse_symbol(tok: str) -> str:
     """sh600000 / sz000001 / 600000 → 纯代码。"""
@@ -145,13 +176,23 @@ def analyze(
     sz, sh = fetch_details(date_str)
     board_margin = margin_by_board(sz, sh)
     total_margin = margin_total(date_str)
-    mv = {k: v for k, v in REFERENCE_MV.items() if k != "date"}
+    live = fetch_live_mv()
+    if live:
+        mv = {k: live[k] for k in ("创业板", "科创板", "沪深两市")}
+        mv_date = live["date"]
+        mv_source = "交易所官方接口(实时)"
+    else:
+        mv = {k: v for k, v in REFERENCE_MV.items() if k != "date"}
+        mv_date = REFERENCE_MV["date"]
+        mv_source = "官方参考值(静态, 接口失败回退)"
     if mv_overrides:
         mv.update(mv_overrides)
+        mv_source = "手动覆盖(--xxx-mv)"
 
     result = {
         "date": date_str,
-        "mv_date": REFERENCE_MV["date"],
+        "mv_date": mv_date,
+        "mv_source": mv_source,
         "threshold": threshold,
         "timestamp": datetime.now().isoformat(),
         "items": [],
@@ -192,7 +233,7 @@ def analyze(
 # ---- 输出 ----
 def format_report(result: dict) -> str:
     lines = ["=" * 60, "市场杠杆风险监测报告",
-             f"数据日期: {result['date']}  (流通市值参考: {result['mv_date']})",
+             f"数据日期: {result['date']}  (流通市值: {result['mv_date']}, {result.get('mv_source', '')})",
              f"风险阈值: 融资余额/流通市值 > {result['threshold']}%",
              "=" * 60, "",
              f"{'标的':<16} {'融资余额(亿)':>12} {'流通市值(亿)':>14} {'占比':>8} {'状态':>8}",
@@ -220,23 +261,29 @@ def format_report(result: dict) -> str:
     else:
         lines.append(f"\n✅ 所有标的均在 {result['threshold']}% 以下，杠杆风险可控。")
 
-    lines.append("\n📋 融资余额: AKShare 沪深交易所 (动态)")
-    lines.append(f"   流通市值: 官方参考值 ({result['mv_date']}), 可用 --xxx-mv 更新")
+    lines.append("\n📋 融资余额: AKShare 沪深交易所 (动态, T+1)")
+    lines.append(f"   流通市值: {result.get('mv_source', '')} ({result['mv_date']}), 可用 --xxx-mv 覆盖")
     return "\n".join(lines)
 
 
 # ---- 自检 (口径一致性) ----
 def self_check():
-    """最小自检: 占比落在合理区间, 捕捉单位换算错误。"""
+    """自检: 实时流通市值获取成功 + 占比落在合理区间 + 与参考值同量级 (捕捉单位换算/接口异常)。"""
     r = analyze()
-    items = {it["name"]: it for it in r["items"]}
-    expect = {"创业板": 4.3, "科创板": 3.4, "沪深两市": 2.90}
-    for name, exp in expect.items():
-        got = items.get(name, {}).get("ratio_pct")
-        assert got and abs(got - exp) < 0.5, f"{name} 占比 {got} 偏离权威值 {exp}%"
-    print("✅ 自检通过 (对照 2026-07-17 权威值):")
+    assert r.get("mv_source", "").startswith("交易所官方"), \
+        f"实时流通市值获取失败, 已回退参考值: {r.get('mv_source')}"
+    ref = {k: v for k, v in REFERENCE_MV.items() if k != "date"}
     for it in r["items"]:
-        print(f"   {it['name']}: 融资余额 {it['margin_yi']}亿, 占比 {it['ratio_pct']}%")
+        name, ratio = it["name"], it.get("ratio_pct")
+        assert ratio and 0 < ratio < 10, f"{name} 占比 {ratio} 越界 [0,10)%"
+        mv = it.get("circ_mv_yi")
+        if mv and name in ref:
+            dev = abs(mv - ref[name]) / ref[name] * 100
+            assert dev < 15, f"{name} 实时流通市值 {mv:,.0f}亿 偏离参考值 {ref[name]:,.0f}亿 {dev:.1f}% (接口异常?)"
+    print("✅ 自检通过:")
+    print(f"   流通市值来源: {r['mv_source']} ({r['mv_date']})")
+    for it in r["items"]:
+        print(f"   {it['name']}: 融资余额 {it['margin_yi']}亿 / 流通市值 {it['circ_mv_yi']:,.0f}亿 = {it['ratio_pct']}%")
 
 
 # ---- 入口 ----
@@ -266,8 +313,12 @@ def main():
     if args.total_mv:
         overrides["沪深两市"] = args.total_mv
 
-    result = analyze(date_str=args.date, threshold=args.threshold, symbols=symbols,
-                     mv_overrides=overrides or None)
+    try:
+        result = analyze(date_str=args.date, threshold=args.threshold, symbols=symbols,
+                         mv_overrides=overrides or None)
+    except ValueError as e:
+        print(f"❌ {e}", file=sys.stderr)
+        sys.exit(1)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
