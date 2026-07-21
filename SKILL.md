@@ -31,7 +31,7 @@ metadata:
 ## 执行步骤
 
 ```bash
-SKILL_DIR=~/.claude/skills/leverage-risk
+# $SKILL_DIR = 技能基目录（触发时由 Claude Code 提供；本项目内为 .claude/skills/leverage-risk）
 
 # 默认: 上一交易日, 沪深两市 + 科创板 + 创业板
 python3 $SKILL_DIR/scripts/leverage_risk.py
