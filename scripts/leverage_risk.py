@@ -10,7 +10,8 @@
     - 沪: stock_sse_summary (主板/科创板/合计, 单位亿元)
     - 深: stock_szse_summary(date=) (创业板/合计, 单位元; 必须带 date, 无参返回异常子集)
     - T 日收盘即有 (比融资余额 T+1 更新), 失败回退 REFERENCE_MV, 可用 --xxx-mv 覆盖。
-  个股流通市值: stock_individual_info_em (东方财富, 被墙时显示 N/A)
+  个股流通市值: AKShare 新浪数据源 — 最新价 (stock_zh_a_spot) × 总股本 (资产负债表) ≈ 总市值
+    (流通占比高时总市值≈流通市值; 无东方财富依赖)
 
 风险阈值: 融资余额 / 流通市值 > 4% 触发警示
 
@@ -31,7 +32,7 @@ from datetime import datetime, timedelta
 
 import akshare as ak
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -124,13 +125,27 @@ def margin_for_symbol(sz, sh, code: str) -> float | None:
 
 
 # ---- 流通市值 ----
-def mv_for_symbol(code: str) -> float | None:
-    """单只标的流通市值 (元) — 东方财富。失败返回 None。"""
+def mv_for_symbol(code: str) -> tuple[float | None, str]:
+    """单只标的流通市值 (元) 及来源。
+
+    仅用 AKShare 新浪数据源: 最新价(stock_zh_a_spot) × 总股本(资产负债表) ≈ 总市值。
+    流通占比高时总市值≈流通市值; 无东方财富依赖。
+    """
     try:
-        info = ak.stock_individual_info_em(symbol=code).set_index("item")["value"]
-        return float(info["流通市值"])
+        spot = ak.stock_zh_a_spot()
+        for prefix in ("sh", "sz"):
+            row = spot[spot["代码"] == f"{prefix}{code}"]
+            if not row.empty:
+                price = float(row.iloc[0]["最新价"])
+                if price > 0:
+                    bs = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
+                    shares = float(bs.iloc[0]["实收资本(或股本)"])
+                    if shares > 0:
+                        return price * shares, "新浪价×总股本(总市值近似)"
+                break
     except Exception:
-        return None
+        pass
+    return None, "N/A"
 
 
 def fetch_live_mv() -> dict | None:
@@ -198,7 +213,7 @@ def analyze(
         "items": [],
     }
 
-    def add(name: str, margin_yuan: float | None, mv_yi: float | None):
+    def add(name: str, margin_yuan: float | None, mv_yi: float | None, mv_source: str = ""):
         if margin_yuan is None:
             result["items"].append({"name": name, "margin_yi": None, "circ_mv_yi": None,
                                     "ratio_pct": None, "is_risk": None,
@@ -209,17 +224,18 @@ def analyze(
             r = margin_yuan / (mv_yi * 1e8) * 100
             result["items"].append({"name": name, "margin_yi": round(m_yi, 2),
                                     "circ_mv_yi": round(mv_yi, 2), "ratio_pct": round(r, 2),
-                                    "is_risk": r > threshold})
+                                    "is_risk": r > threshold, "mv_source": mv_source})
         else:
             result["items"].append({"name": name, "margin_yi": round(m_yi, 2),
-                                    "circ_mv_yi": None, "ratio_pct": None, "is_risk": None})
+                                    "circ_mv_yi": None, "ratio_pct": None, "is_risk": None,
+                                    "mv_source": mv_source})
 
     if symbols:
         for raw in symbols:
             code = parse_symbol(raw)
             m = margin_for_symbol(sz, sh, code)
-            sym_mv = mv_for_symbol(code)
-            add(raw, m, sym_mv / 1e8 if sym_mv else None)
+            sym_mv, sym_src = mv_for_symbol(code)
+            add(raw, m, sym_mv / 1e8 if sym_mv else None, mv_source=sym_src)
     else:
         for seg in (segments or DEFAULT_SEGMENTS):
             if seg == "沪深两市":
@@ -263,6 +279,10 @@ def format_report(result: dict) -> str:
 
     lines.append("\n📋 融资余额: AKShare 沪深交易所 (动态, T+1)")
     lines.append(f"   流通市值: {result.get('mv_source', '')} ({result['mv_date']}), 可用 --xxx-mv 覆盖")
+    # 个股流通市值来源说明
+    for it in result["items"]:
+        if it.get("mv_source") and it["mv_source"] not in ("", "N/A"):
+            lines.append(f"   · {it['name']}: 流通市值来源 = {it['mv_source']}")
     return "\n".join(lines)
 
 
