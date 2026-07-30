@@ -2,3 +2,4 @@
 summary.md
 __pycache__/
 *.pyc
+output/
