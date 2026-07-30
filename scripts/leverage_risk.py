@@ -10,8 +10,8 @@
     - 沪: stock_sse_summary (主板/科创板/合计, 单位亿元)
     - 深: stock_szse_summary(date=) (创业板/合计, 单位元; 必须带 date, 无参返回异常子集)
     - T 日收盘即有 (比融资余额 T+1 更新), 失败回退 REFERENCE_MV, 可用 --xxx-mv 覆盖。
-  个股流通市值: AKShare 新浪数据源 — 最新价 (stock_zh_a_spot) × 总股本 (资产负债表) ≈ 总市值
-    (流通占比高时总市值≈流通市值; 无东方财富依赖)
+  个股流通市值: AKShare 新浪数据源 — 最新收盘价 (stock_zh_a_daily) × 总股本 (资产负债表实收资本) ≈ 总市值
+    (spot 实时价开市前为0, 故用日线最近收盘价; 流通占比高时总市值≈流通市值; 无东方财富依赖)
 
 风险阈值: 融资余额 / 流通市值 > 4% 触发警示
 
@@ -32,7 +32,7 @@ from datetime import datetime, timedelta
 
 import akshare as ak
 
-__version__ = "1.3.0"
+__version__ = "1.3.1"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -128,24 +128,24 @@ def margin_for_symbol(sz, sh, code: str) -> float | None:
 def mv_for_symbol(code: str) -> tuple[float | None, str]:
     """单只标的流通市值 (元) 及来源。
 
-    仅用 AKShare 新浪数据源: 最新价(stock_zh_a_spot) × 总股本(资产负债表) ≈ 总市值。
+    新浪收盘价(stock_zh_a_daily) × 总股本(资产负债表实收资本) ≈ 总市值。
     流通占比高时总市值≈流通市值; 无东方财富依赖。
+    ponytail: 实收资本单位为元, A股面值1元故数值=股本(股); 用总股本算的是总市值,
+              次新股有限售股时偏高; stock_zh_a_spot 全市场价格常返0故改用日线。
     """
+    prefix = "sh" if code.startswith(("5", "6", "9")) else "sz"
     try:
-        spot = ak.stock_zh_a_spot()
-        for prefix in ("sh", "sz"):
-            row = spot[spot["代码"] == f"{prefix}{code}"]
-            if not row.empty:
-                price = float(row.iloc[0]["最新价"])
-                if price > 0:
-                    bs = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
-                    shares = float(bs.iloc[0]["实收资本(或股本)"])
-                    if shares > 0:
-                        return price * shares, "新浪价×总股本(总市值近似)"
-                break
-    except Exception:
-        pass
-    return None, "N/A"
+        daily = ak.stock_zh_a_daily(symbol=f"{prefix}{code}", adjust="")
+        price = float(daily.iloc[-1]["close"])
+        if price <= 0:
+            return None, "N/A(收盘价为0)"
+        bs = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
+        shares = float(bs.iloc[0]["实收资本(或股本)"])
+        if shares <= 0:
+            return None, "N/A(股本为0)"
+        return price * shares, "新浪收盘价×总股本(总市值近似)"
+    except Exception as e:
+        return None, f"N/A({type(e).__name__})"
 
 
 def fetch_live_mv() -> dict | None:

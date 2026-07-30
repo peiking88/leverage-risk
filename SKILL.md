@@ -23,7 +23,7 @@ metadata:
   └── 深: stock_szse_summary(date=) → 创业板/合计 (元; 必须带 date, 无参返回异常子集)
   ↳ 回退/覆盖: REFERENCE_MV 或 --xxx-mv
 个股流通市值
-  └── stock_individual_info_em(symbol)  → 东方财富(被墙时个股流通市值显示 N/A)
+  └── 新浪收盘价(stock_zh_a_daily) × 总股本(资产负债表实收资本) ≈ 总市值 (无东方财富依赖)
 ```
 
 > **为何深市必须带 date**：`stock_szse_summary()` 无参返回异常子集（创业板 69,004 亿，

@@ -52,7 +52,7 @@ python3 scripts/leverage_risk.py --self-check
 - **单位不对称（坑）**：`stock_margin_sse` 融资余额为**元**，`stock_margin_szse` 为**亿元**（×1e8 统一）。
 - **沪深合计用汇总口径**：`沪深两市` 行融资余额取 `stock_margin_sse/szse` 汇总（27,491 亿），略大于 4 板块明细之和（明细仅含两融标的），属正常。
 - **板块分类**：按代码前缀。沪市主板取 600/601/603/605（排除 688），深市主板排除 300/301。
-- **默认标的集**：创业板 + 科创板 + 沪深两市。`--symbols` 切换个股模式（融资余额取明细，流通市值取 `stock_individual_info_em`，被墙时 N/A）。
+- **默认标的集**：创业板 + 科创板 + 沪深两市。`--symbols` 切换个股模式（融资余额取明细，流通市值取 `stock_zh_a_daily` 收盘价×总股本(新浪)，无东方财富依赖）。
 
 ### 数据源可靠性速查
 
@@ -64,8 +64,8 @@ python3 scripts/leverage_risk.py --self-check
 | `stock_sse_summary` | 沪市流通市值（主板/科创板/合计） | ✅ 可靠 | T 日收盘即有；单位亿元 |
 | `stock_szse_summary(date=)` | 深市流通市值（主板/创业板/合计） | ✅ **带 date 可靠** | **必须带 date 参数**；单位元。无参调用返回异常子集（创业板 69,004 亿，约为真实值一半） |
 | `stock_zh_a_spot_em` | 全市场逐股流通市值求和 | ⚠️ 受限 | 东方财富服务器，部分网络环境被墙（RemoteDisconnected） |
-| `stock_zh_a_spot` | 新浪全市场行情 | ⚠️ 无市值列 | 可达但仅含价格/成交量，无流通市值列，不可用于自行求和 |
-| `stock_individual_info_em` | 个股流通市值 | ⚠️ 受限 | 同 `spot_em`，被墙时 `--symbols` 个股流通市值显示 N/A |
+| `stock_zh_a_spot` | 新浪全市场行情 | ⚠️ 不稳 | 开市前最新价为0，不可用于取价；无流通市值列 |
+| `stock_zh_a_daily` | 个股最新收盘价 | ✅ 可靠 | 个股流通市值取价用；末行=最近交易日收盘，时点与融资余额(T+1)匹配 |
 
 ### 经验教训
 
