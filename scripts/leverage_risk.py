@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-市场杠杆风险监测 — 融资余额 / 流通市值。
+市场杠杆风险监测 — 融资余额 / 流通市值 + 交易拥挤度。
 
 数据策略:
   融资余额 (动态, 交易所接口可靠):
@@ -12,8 +12,10 @@
     - T 日收盘即有 (比融资余额 T+1 更新), 失败回退 REFERENCE_MV, 可用 --xxx-mv 覆盖。
   个股流通市值: AKShare 新浪数据源 — 最新收盘价 (stock_zh_a_daily) × 总股本 (资产负债表实收资本) ≈ 总市值
     (spot 实时价开市前为0, 故用日线最近收盘价; 流通占比高时总市值≈流通市值; 无东方财富依赖)
+  交易拥挤度: 新浪全市场行情 (stock_zh_a_spot) — 成交额排名前5%个股总成交额 / 全市场成交额
+    (ponytail: 新浪接口开市前价格为0但不影响成交额列, 获取失败时跳过拥挤度, 不影响杠杆主体分析)
 
-风险阈值: 融资余额 / 流通市值 > 4% 触发警示
+风险阈值: 融资余额/流通市值 > 4% 触发警示; 交易拥挤度 >= 45% 触发警示
 
 用法:
   python3 leverage_risk.py                            # 默认: 上一交易日, 沪深两市+科创板+创业板
@@ -32,10 +34,12 @@ from datetime import datetime, timedelta
 
 import akshare as ak
 
-__version__ = "1.3.1"
+__version__ = "1.4.2"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
+CROWDING_THRESHOLD = 45.0  # 成交额前5%个股占比 >= 45% 触发拥挤度警示
+CROWDING_TOP_PCT = 0.05    # 排名前列个股比例
 # 默认监测标的集: 创业板 + 科创板 + 沪深两市合计
 DEFAULT_SEGMENTS = ["创业板", "科创板", "沪深两市"]
 
@@ -140,9 +144,17 @@ def mv_for_symbol(code: str) -> tuple[float | None, str]:
         if price <= 0:
             return None, "N/A(收盘价为0)"
         bs = ak.stock_financial_report_sina(stock=code, symbol="资产负债表")
-        shares = float(bs.iloc[0]["实收资本(或股本)"])
-        if shares <= 0:
-            return None, "N/A(股本为0)"
+        # akshare 列名不一致: 沪市主板返回 "股本", 创业板/科创板返回 "实收资本(或股本)"
+        row = bs.iloc[0]
+        shares = None
+        for col in ("实收资本(或股本)", "股本"):
+            if col in bs.columns:
+                v = row[col]
+                if v is not None and not (isinstance(v, float) and v != v) and float(v) > 0:  # 非NaN且>0
+                    shares = float(v)
+                    break
+        if shares is None:
+            return None, "N/A(股本列缺失或无效)"
         return price * shares, "新浪收盘价×总股本(总市值近似)"
     except Exception as e:
         return None, f"N/A({type(e).__name__})"
@@ -168,6 +180,37 @@ def fetch_live_mv() -> dict | None:
         return None
 
 
+# ---- 交易拥挤度 ----
+def fetch_crowding() -> dict | None:
+    """交易拥挤度: 成交额排名前5%个股总成交额 / 全市场成交额 (%)。
+
+    数据来源: 新浪全市场行情 (stock_zh_a_spot), "成交额" 单位元 (非东方财富)。
+    失败返回 None, 调用方跳过, 不影响杠杆主体分析。
+    返回 dict: ratio(%), top_n, total_n, top_amount_yi, total_amount_yi。
+    """
+    try:
+        spot = ak.stock_zh_a_spot()
+        amt = spot["成交额"].dropna()
+        if amt.empty:
+            return None
+        amt = amt.sort_values(ascending=False)
+        total = float(amt.sum())
+        if total <= 0:
+            return None
+        n = len(amt)
+        top_n = max(1, int(n * CROWDING_TOP_PCT + 0.5))  # 四舍五入取整
+        top_sum = float(amt.iloc[:top_n].sum())
+        return {
+            "ratio": round(top_sum / total * 100, 2),
+            "top_n": top_n,
+            "total_n": n,
+            "top_amount_yi": round(top_sum / 1e8, 2),
+            "total_amount_yi": round(total / 1e8, 2),
+        }
+    except Exception:
+        return None
+
+
 # ---- 标的解析 ----
 def parse_symbol(tok: str) -> str:
     """sh600000 / sz000001 / 600000 → 纯代码。"""
@@ -185,6 +228,7 @@ def analyze(
     symbols: list[str] | None = None,
     segments: list[str] | None = None,
     mv_overrides: dict[str, float] | None = None,
+    crowding_threshold: float = CROWDING_THRESHOLD,
 ) -> dict:
     """执行杠杆风险分析。"""
     date_str = resolve_date(date_str)
@@ -243,6 +287,13 @@ def analyze(
             else:
                 add(seg, board_margin.get(seg, 0.0), mv.get(seg))
 
+    # 交易拥挤度 (仅全市场模式; 获取失败返回 None, 不影响杠杆分析)
+    crowding = fetch_crowding() if not symbols else None
+    if crowding:
+        crowding["threshold"] = crowding_threshold
+        crowding["is_risk"] = crowding["ratio"] >= crowding_threshold
+    result["crowding"] = crowding
+
     return result
 
 
@@ -272,8 +323,22 @@ def format_report(result: dict) -> str:
         lines.append(f"{name:<16} {margin_str:>12} {circ_str:>14} {ratio_str:>8} {status:>8}")
 
     lines.append("-" * 60)
+
+    # 交易拥挤度
+    cr = result.get("crowding")
+    if cr:
+        cr_threshold = cr.get("threshold", CROWDING_THRESHOLD)
+        cr_status = "🔴 风险" if cr.get("is_risk") else "🟢 安全"
+        if cr.get("is_risk"):
+            risk_names.append(f"交易拥挤度({cr['ratio']:.2f}% >= {cr_threshold}%)")
+        lines.append(f"\n交易拥挤度 (成交额前{CROWDING_TOP_PCT:.0%}个股占比): {cr['ratio']:.2f}%  {cr_status}")
+        lines.append(f"  前 {cr['top_n']} 股成交额 {cr['top_amount_yi']:,.2f}亿 / 全市场 {cr['total_amount_yi']:,.2f}亿"
+                     f"  (共 {cr['total_n']} 股)")
+    else:
+        lines.append("\n交易拥挤度: 未计算 (个股模式, 或新浪行情接口获取失败)")
+
     if risk_names:
-        lines.append(f"\n⚠️  风险警示: {', '.join(risk_names)} 超过 {result['threshold']}% 阈值")
+        lines.append(f"\n⚠️  风险警示: {', '.join(risk_names)}")
     else:
         lines.append(f"\n✅ 所有标的均在 {result['threshold']}% 以下，杠杆风险可控。")
 
@@ -312,7 +377,9 @@ def main():
     parser.add_argument("--date", help="融资余额日期 YYYYMMDD (默认: 上一交易日)")
     parser.add_argument("--symbols", help="指定标的, 逗号分隔, 如 sh600000,sz300750 (默认: 沪深两市+科创板+创业板)")
     parser.add_argument("--threshold", type=float, default=RISK_THRESHOLD,
-                        help=f"风险阈值%% (默认 {RISK_THRESHOLD})")
+                        help=f"杠杆风险阈值%% (默认 {RISK_THRESHOLD})")
+    parser.add_argument("--crowding-threshold", type=float, default=CROWDING_THRESHOLD,
+                        help=f"拥挤度阈值%% (成交额前{int(CROWDING_TOP_PCT*100)}%%个股占比, 默认 {CROWDING_THRESHOLD})")
     parser.add_argument("--cyb-mv", type=float, help="创业板流通市值(亿元)")
     parser.add_argument("--kcb-mv", type=float, help="科创板流通市值(亿元)")
     parser.add_argument("--total-mv", type=float, help="沪深两市流通市值(亿元)")
@@ -335,7 +402,8 @@ def main():
 
     try:
         result = analyze(date_str=args.date, threshold=args.threshold, symbols=symbols,
-                         mv_overrides=overrides or None)
+                         mv_overrides=overrides or None,
+                         crowding_threshold=args.crowding_threshold)
     except ValueError as e:
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
