@@ -34,7 +34,7 @@ from datetime import datetime, timedelta
 
 import akshare as ak
 
-__version__ = "1.4.2"
+__version__ = "1.5.0"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -181,32 +181,52 @@ def fetch_live_mv() -> dict | None:
 
 
 # ---- 交易拥挤度 ----
-def fetch_crowding() -> dict | None:
-    """交易拥挤度: 成交额排名前5%个股总成交额 / 全市场成交额 (%)。
+def _board_of(code: str) -> str:
+    """按代码前缀分类板块 (用于拥挤度分组)。"""
+    c = code[2:] if code[:2] in ("sh", "sz", "bj") else code
+    if c.startswith(("300", "301")):
+        return "创业板"
+    if c.startswith("688"):
+        return "科创板"
+    return "主板"  # 沪深两市 = 全市场, 此处仅作兜底分类
 
-    数据来源: 新浪全市场行情 (stock_zh_a_spot), "成交额" 单位元 (非东方财富)。
-    失败返回 None, 调用方跳过, 不影响杠杆主体分析。
-    返回 dict: ratio(%), top_n, total_n, top_amount_yi, total_amount_yi。
+
+def fetch_crowding() -> dict | None:
+    """交易拥挤度按板块: 各板块成交额排名前5%个股总成交额 / 该板块成交额 (%)。
+
+    数据来源: 新浪全市场行情 (stock_zh_a_spot), "成交额" 单位元。
+    返回 {板块: {ratio, top_n, total_n, top_amount_yi, total_amount_yi}}，
+    含 "创业板"、"科创板"、"沪深两市"(全市场); 失败返回 None。
     """
     try:
         spot = ak.stock_zh_a_spot()
-        amt = spot["成交额"].dropna()
-        if amt.empty:
+        df = spot[["代码", "成交额"]].dropna(subset=["成交额"])
+        df = df[df["成交额"] > 0].copy()
+        if df.empty:
             return None
-        amt = amt.sort_values(ascending=False)
-        total = float(amt.sum())
-        if total <= 0:
-            return None
-        n = len(amt)
-        top_n = max(1, int(n * CROWDING_TOP_PCT + 0.5))  # 四舍五入取整
-        top_sum = float(amt.iloc[:top_n].sum())
-        return {
-            "ratio": round(top_sum / total * 100, 2),
-            "top_n": top_n,
-            "total_n": n,
-            "top_amount_yi": round(top_sum / 1e8, 2),
-            "total_amount_yi": round(total / 1e8, 2),
-        }
+        df["board"] = df["代码"].astype(str).map(_board_of)
+
+        def _calc(amt):
+            s = amt.sort_values(ascending=False)
+            total = float(s.sum())
+            n = len(s)
+            top_n = max(1, int(n * CROWDING_TOP_PCT + 0.5))  # 四舍五入取整
+            top_sum = float(s.iloc[:top_n].sum())
+            return {
+                "ratio": round(top_sum / total * 100, 2) if total > 0 else 0.0,
+                "top_n": top_n,
+                "total_n": n,
+                "top_amount_yi": round(top_sum / 1e8, 2),
+                "total_amount_yi": round(total / 1e8, 2),
+            }
+
+        out = {}
+        for board in ("创业板", "科创板"):
+            sub = df[df["board"] == board]["成交额"]
+            if not sub.empty:
+                out[board] = _calc(sub)
+        out["沪深两市"] = _calc(df["成交额"])  # 沪深两市 = 全市场口径
+        return out
     except Exception:
         return None
 
@@ -253,11 +273,13 @@ def analyze(
         "mv_date": mv_date,
         "mv_source": mv_source,
         "threshold": threshold,
+        "crowding_threshold": crowding_threshold,
         "timestamp": datetime.now().isoformat(),
         "items": [],
     }
 
-    def add(name: str, margin_yuan: float | None, mv_yi: float | None, mv_source: str = ""):
+    def add(name: str, margin_yuan: float | None, mv_yi: float | None, mv_source: str = "",
+            crowding_ratio: float | None = None):
         if margin_yuan is None:
             result["items"].append({"name": name, "margin_yi": None, "circ_mv_yi": None,
                                     "ratio_pct": None, "is_risk": None,
@@ -266,13 +288,19 @@ def analyze(
         m_yi = margin_yuan / 1e8
         if mv_yi and mv_yi > 0:
             r = margin_yuan / (mv_yi * 1e8) * 100
-            result["items"].append({"name": name, "margin_yi": round(m_yi, 2),
-                                    "circ_mv_yi": round(mv_yi, 2), "ratio_pct": round(r, 2),
-                                    "is_risk": r > threshold, "mv_source": mv_source})
+            item = {"name": name, "margin_yi": round(m_yi, 2), "circ_mv_yi": round(mv_yi, 2),
+                    "ratio_pct": round(r, 2), "is_risk": r > threshold, "mv_source": mv_source}
         else:
-            result["items"].append({"name": name, "margin_yi": round(m_yi, 2),
-                                    "circ_mv_yi": None, "ratio_pct": None, "is_risk": None,
-                                    "mv_source": mv_source})
+            item = {"name": name, "margin_yi": round(m_yi, 2), "circ_mv_yi": None,
+                    "ratio_pct": None, "is_risk": None, "mv_source": mv_source}
+        # 交易拥挤度 (按板块)
+        if crowding_ratio is not None:
+            item["crowding_ratio"] = crowding_ratio
+            item["crowding_risk"] = crowding_ratio >= crowding_threshold
+        result["items"].append(item)
+
+    # 交易拥挤度 (仅全市场模式; 获取失败返回 None, 不影响杠杆分析)
+    crowding = fetch_crowding() if not symbols else None
 
     if symbols:
         for raw in symbols:
@@ -282,29 +310,27 @@ def analyze(
             add(raw, m, sym_mv / 1e8 if sym_mv else None, mv_source=sym_src)
     else:
         for seg in (segments or DEFAULT_SEGMENTS):
+            cr = crowding.get(seg, {}).get("ratio") if crowding else None
             if seg == "沪深两市":
-                add("沪深两市", total_margin, mv.get("沪深两市"))
+                add("沪深两市", total_margin, mv.get("沪深两市"), crowding_ratio=cr)
             else:
-                add(seg, board_margin.get(seg, 0.0), mv.get(seg))
+                add(seg, board_margin.get(seg, 0.0), mv.get(seg), crowding_ratio=cr)
 
-    # 交易拥挤度 (仅全市场模式; 获取失败返回 None, 不影响杠杆分析)
-    crowding = fetch_crowding() if not symbols else None
-    if crowding:
-        crowding["threshold"] = crowding_threshold
-        crowding["is_risk"] = crowding["ratio"] >= crowding_threshold
-    result["crowding"] = crowding
+    result["crowding"] = crowding  # {板块: {...}} 或 None
 
     return result
 
 
 # ---- 输出 ----
 def format_report(result: dict) -> str:
-    lines = ["=" * 60, "市场杠杆风险监测报告",
+    cr_threshold = result.get("crowding_threshold", CROWDING_THRESHOLD)
+    lines = ["=" * 70, "市场杠杆风险监测报告",
              f"数据日期: {result['date']}  (流通市值: {result['mv_date']}, {result.get('mv_source', '')})",
-             f"风险阈值: 融资余额/流通市值 > {result['threshold']}%",
-             "=" * 60, "",
-             f"{'标的':<16} {'融资余额(亿)':>12} {'流通市值(亿)':>14} {'占比':>8} {'状态':>8}",
-             "-" * 60]
+             f"风险阈值: 融资余额/流通市值 > {result['threshold']}%   "
+             f"交易拥挤度(前{CROWDING_TOP_PCT:.0%}个股占比) >= {cr_threshold}%",
+             "=" * 70, "",
+             f"{'标的':<12} {'融资余额(亿)':>12} {'流通市值(亿)':>12} {'占比':>7} {'拥挤度':>7} {'状态':>6}",
+             "-" * 70]
 
     risk_names = []
     for it in result["items"]:
@@ -312,6 +338,13 @@ def format_report(result: dict) -> str:
         margin_str = f"{it['margin_yi']:,.2f}" if it.get("margin_yi") is not None else "N/A"
         circ_str = f"{it['circ_mv_yi']:,.2f}" if it.get("circ_mv_yi") else "N/A"
         ratio_str = f"{it['ratio_pct']:.2f}%" if it.get("ratio_pct") is not None else "N/A"
+        # 拥挤度列
+        cr_ratio = it.get("crowding_ratio")
+        if cr_ratio is not None:
+            cr_flag = "🔴" if it.get("crowding_risk") else "🟢"
+            crowding_str = f"{cr_ratio:.1f}%{cr_flag}"
+        else:
+            crowding_str = "—"
         is_risk = it.get("is_risk")
         if is_risk is True:
             status = "🔴 风险"
@@ -320,21 +353,19 @@ def format_report(result: dict) -> str:
             status = "🟢 安全"
         else:
             status = "❓"
-        lines.append(f"{name:<16} {margin_str:>12} {circ_str:>14} {ratio_str:>8} {status:>8}")
+        lines.append(f"{name:<12} {margin_str:>12} {circ_str:>12} {ratio_str:>7} {crowding_str:>7} {status:>6}")
+        # 拥挤度风险记入警示
+        if it.get("crowding_risk"):
+            risk_names.append(f"{name}拥挤度{cr_ratio:.1f}%")
 
-    lines.append("-" * 60)
+    lines.append("-" * 70)
 
-    # 交易拥挤度
-    cr = result.get("crowding")
+    # 拥挤度明细 (全市场口径)
+    cr = result.get("crowding", {}).get("沪深两市") if result.get("crowding") else None
     if cr:
-        cr_threshold = cr.get("threshold", CROWDING_THRESHOLD)
-        cr_status = "🔴 风险" if cr.get("is_risk") else "🟢 安全"
-        if cr.get("is_risk"):
-            risk_names.append(f"交易拥挤度({cr['ratio']:.2f}% >= {cr_threshold}%)")
-        lines.append(f"\n交易拥挤度 (成交额前{CROWDING_TOP_PCT:.0%}个股占比): {cr['ratio']:.2f}%  {cr_status}")
-        lines.append(f"  前 {cr['top_n']} 股成交额 {cr['top_amount_yi']:,.2f}亿 / 全市场 {cr['total_amount_yi']:,.2f}亿"
-                     f"  (共 {cr['total_n']} 股)")
-    else:
+        lines.append(f"\n📊 拥挤度明细 — 全市场: 前 {cr['top_n']} 股成交额 {cr['top_amount_yi']:,.2f}亿"
+                     f" / 全市场 {cr['total_amount_yi']:,.2f}亿 (共 {cr['total_n']} 股)")
+    elif not result["items"] or result["items"][0].get("crowding_ratio") is None:
         lines.append("\n交易拥挤度: 未计算 (个股模式, 或新浪行情接口获取失败)")
 
     if risk_names:
