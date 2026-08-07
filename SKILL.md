@@ -1,7 +1,7 @@
 ---
 name: leverage-risk
 description: 衡量股票市场主板、创业板、科创板杠杆风险。获取最新融资余额数据，计算各板块融资余额占流通市值比例，大于4%给出风险警示；同步计算交易拥挤度（成交额前5%个股占比，>=45%风险）。当用户问"杠杆风险/融资余额/两融占比/市场杠杆/融资余额占比/杠杆率/交易拥挤度"时使用。
-version: 1.6.2
+version: 1.6.3
 author: peiking88
 license: MIT
 metadata:
@@ -137,7 +137,7 @@ python3 $SKILL_DIR/scripts/leverage_risk.py --export /tmp/top.xlsx   # 指定路
 ```
 akshare >= 1.0
 pandas >= 1.0
-openpyxl >= 3.0   # Excel 导出 (--export-top)
+openpyxl >= 3.0   # Excel 导出 (--export)
 ```
 
 ## 数据时效性

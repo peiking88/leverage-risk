@@ -36,7 +36,7 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
