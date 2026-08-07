@@ -28,13 +28,15 @@
 
 import argparse
 import json
+import os
 import sys
 import time
 from datetime import datetime, timedelta
 
 import akshare as ak
+import pandas as pd
 
-__version__ = "1.5.0"
+__version__ = "1.6.2"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -195,40 +197,89 @@ def fetch_crowding() -> dict | None:
     """交易拥挤度按板块: 各板块成交额排名前5%个股总成交额 / 该板块成交额 (%)。
 
     数据来源: 新浪全市场行情 (stock_zh_a_spot), "成交额" 单位元。
-    返回 {板块: {ratio, top_n, total_n, top_amount_yi, total_amount_yi}}，
-    含 "创业板"、"科创板"、"沪深两市"(全市场); 失败返回 None。
+    返回 {板块: {ratio, top_n, total_n, top_amount_yi, total_amount_yi, top_detail}}，
+    含 "创业板"、"科创板"、"沪深两市"(全市场); top_detail = 前5%个股明细 DataFrame
+    (代码/名称/板块/成交额(亿)/成交额占比(%), 按成交额降序); 失败返回 None。
     """
     try:
         spot = ak.stock_zh_a_spot()
-        df = spot[["代码", "成交额"]].dropna(subset=["成交额"])
+        df = spot[["代码", "名称", "成交额"]].dropna(subset=["成交额"])
         df = df[df["成交额"] > 0].copy()
         if df.empty:
             return None
         df["board"] = df["代码"].astype(str).map(_board_of)
 
-        def _calc(amt):
-            s = amt.sort_values(ascending=False)
-            total = float(s.sum())
-            n = len(s)
+        def _calc(sub):  # sub: 含 代码/名称/成交额/board 的子集
+            sub = sub.sort_values("成交额", ascending=False)
+            total = float(sub["成交额"].sum())
+            n = len(sub)
             top_n = max(1, int(n * CROWDING_TOP_PCT + 0.5))  # 四舍五入取整
-            top_sum = float(s.iloc[:top_n].sum())
+            top = sub.iloc[:top_n]
+            top_sum = float(top["成交额"].sum())
+            amt = top["成交额"].to_numpy()
+            detail = (top[["代码", "名称", "board", "成交额"]]
+                      .rename(columns={"board": "板块"})
+                      .assign(**{"成交额(亿)": (amt / 1e8).round(2),
+                                 "成交额占比(%)": (amt / total * 100).round(3)})
+                      [["代码", "名称", "板块", "成交额(亿)", "成交额占比(%)"]]
+                      .reset_index(drop=True))
             return {
                 "ratio": round(top_sum / total * 100, 2) if total > 0 else 0.0,
                 "top_n": top_n,
                 "total_n": n,
                 "top_amount_yi": round(top_sum / 1e8, 2),
                 "total_amount_yi": round(total / 1e8, 2),
+                "top_detail": detail,
             }
 
         out = {}
         for board in ("创业板", "科创板"):
-            sub = df[df["board"] == board]["成交额"]
+            sub = df[df["board"] == board]
             if not sub.empty:
                 out[board] = _calc(sub)
-        out["沪深两市"] = _calc(df["成交额"])  # 沪深两市 = 全市场口径
+        out["沪深两市"] = _calc(df)  # 沪深两市 = 全市场口径
         return out
     except Exception:
         return None
+
+
+# 导出 --export 时按名称剔除的行业关键词 (银行/煤炭/电力类权重股)
+# ponytail: 名称匹配有局限 (如"中国神华"无"煤"会漏、"电子/电气"含"电"非电力), 用户接受;
+#           命中任一关键词即剔除。需精确时改行业接口。
+EXCLUDE_NAME_KEYWORDS = ["银行", "煤", "电力", "能源", "水电", "核电", "风电", "火电"]
+
+
+def _is_excluded_industry(name: str) -> bool:
+    """名称是否属于银行/煤炭/电力类 (按关键词命中)。"""
+    return any(k in str(name) for k in EXCLUDE_NAME_KEYWORDS)
+
+
+def export_top_excel(result: dict, path: str) -> tuple[str, int]:
+    """导出各板块成交额前5%个股明细到 Excel (每板块一个 sheet, 含名称)。
+
+    自动剔除名称匹配银行/煤炭/电力的权重股 (仅影响导出列表, 不改拥挤度计算)。
+    依赖 fetch_crowding() 返回的 top_detail; 个股模式或行情接口失败时无数据, 抛 ValueError。
+    返回 (path, 剔除只数)。
+    """
+    crowding = result.get("crowding")
+    if not crowding:
+        raise ValueError("无拥挤度数据 (个股模式或新浪行情接口失败), 跳过导出")
+    sheets, excluded = {}, 0
+    for b, c in crowding.items():
+        d = c.get("top_detail")
+        if not (isinstance(d, pd.DataFrame) and not d.empty):
+            continue
+        keep = d[~d["名称"].map(_is_excluded_industry)]
+        excluded += len(d) - len(keep)
+        if not keep.empty:
+            sheets[b] = keep
+    if not sheets:
+        raise ValueError("剔除银行/煤炭/电力后无可导出个股")
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as w:
+        for name, df in sheets.items():
+            df.to_excel(w, sheet_name=name, index=False)
+    return path, excluded
 
 
 # ---- 标的解析 ----
@@ -411,6 +462,9 @@ def main():
                         help=f"杠杆风险阈值%% (默认 {RISK_THRESHOLD})")
     parser.add_argument("--crowding-threshold", type=float, default=CROWDING_THRESHOLD,
                         help=f"拥挤度阈值%% (成交额前{int(CROWDING_TOP_PCT*100)}%%个股占比, 默认 {CROWDING_THRESHOLD})")
+    parser.add_argument("--export", nargs="?", const="", metavar="PATH",
+                        help="导出成交额前5%%个股到 Excel (每板块一 sheet, 含名称; "
+                             "不给路径默认 output/crowding_top_{date}.xlsx)")
     parser.add_argument("--cyb-mv", type=float, help="创业板流通市值(亿元)")
     parser.add_argument("--kcb-mv", type=float, help="科创板流通市值(亿元)")
     parser.add_argument("--total-mv", type=float, help="沪深两市流通市值(亿元)")
@@ -438,6 +492,17 @@ def main():
     except ValueError as e:
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
+
+    if args.export is not None:
+        path = args.export or f"output/crowding_top_{result['date']}.xlsx"
+        try:
+            path, excluded = export_top_excel(result, path)
+            msg = f"📄 已导出成交额前5%个股: {path}"
+            if excluded:
+                msg += f" (已剔除银行/煤炭/电力 {excluded} 只)"
+            print(msg, file=sys.stderr if args.json else sys.stdout)
+        except ValueError as e:
+            print(f"⚠️  {e}", file=sys.stderr)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))

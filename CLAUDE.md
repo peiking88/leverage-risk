@@ -25,6 +25,9 @@ python3 scripts/leverage_risk.py --cyb-mv 144934.15 --total-mv 948326
 python3 scripts/leverage_risk.py --json
 python3 scripts/leverage_risk.py --threshold 5.0
 python3 scripts/leverage_risk.py --self-check
+
+# 导出成交额前5%个股到 Excel (剔除银行/煤炭/电力类, 默认 output/crowding_top_{date}.xlsx)
+python3 scripts/leverage_risk.py --export
 ```
 
 ## Architecture
@@ -99,6 +102,7 @@ hot-skills/financial/leverage-risk/           # 项目根 = git 仓库
 ```
 akshare >= 1.0    # 唯一外部数据源
 pandas >= 1.0     # 随 akshare 引入
+openpyxl >= 3.0   # Excel 导出 (--export)
 ```
 
 ## Validation (2026-07-17 官方口径)

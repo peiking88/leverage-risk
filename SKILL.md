@@ -1,7 +1,7 @@
 ---
 name: leverage-risk
 description: 衡量股票市场主板、创业板、科创板杠杆风险。获取最新融资余额数据，计算各板块融资余额占流通市值比例，大于4%给出风险警示；同步计算交易拥挤度（成交额前5%个股占比，>=45%风险）。当用户问"杠杆风险/融资余额/两融占比/市场杠杆/融资余额占比/杠杆率/交易拥挤度"时使用。
-version: 1.4.2
+version: 1.6.2
 author: peiking88
 license: MIT
 metadata:
@@ -55,6 +55,10 @@ python3 $SKILL_DIR/scripts/leverage_risk.py --cyb-mv 144934.15 --total-mv 948326
 python3 $SKILL_DIR/scripts/leverage_risk.py --json
 python3 $SKILL_DIR/scripts/leverage_risk.py --threshold 5.0
 python3 $SKILL_DIR/scripts/leverage_risk.py --self-check
+
+# 导出成交额前5%个股到 Excel (每板块一 sheet, 含名称; 剔除银行/煤炭/电力类; 不给路径默认 output/crowding_top_{date}.xlsx)
+python3 $SKILL_DIR/scripts/leverage_risk.py --export
+python3 $SKILL_DIR/scripts/leverage_risk.py --export /tmp/top.xlsx   # 指定路径
 ```
 
 ## 参数
@@ -68,6 +72,7 @@ python3 $SKILL_DIR/scripts/leverage_risk.py --self-check
 | `--total-mv` | 实时获取 | 沪深两市流通市值(亿元, 手动覆盖实时值) |
 | `--threshold` | 4.0 | 杠杆风险阈值 % |
 | `--crowding-threshold` | 45.0 | 拥挤度阈值 % (成交额前5%个股占比) |
+| `--export` | 关 | 导出成交额前5%个股到 Excel (每板块一 sheet, 含名称; 自动剔除银行/煤炭/电力类; 可选路径, 默认 output/) |
 | `--json` | 关 | JSON 输出 |
 | `--self-check` | 关 | 对照权威值运行口径自检 |
 
@@ -125,13 +130,14 @@ python3 $SKILL_DIR/scripts/leverage_risk.py --self-check
 
 ## 脚本
 
-- `scripts/leverage_risk.py` — 主分析脚本（仅依赖 AKShare + pandas）
+- `scripts/leverage_risk.py` — 主分析脚本（依赖 AKShare + pandas + openpyxl）
 
 ## 依赖
 
 ```
 akshare >= 1.0
 pandas >= 1.0
+openpyxl >= 3.0   # Excel 导出 (--export-top)
 ```
 
 ## 数据时效性
