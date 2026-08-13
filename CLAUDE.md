@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-**leverage-risk** — 市场杠杆风险监测技能。计算 A 股主板、创业板、科创板融资余额占各自流通市值的比例，>4% 触发风险警示；同步计算交易拥挤度（成交额前5%个股占比，>=45% 风险）。
+**leverage-risk** — 市场杠杆风险监测技能。计算 A 股主板、创业板、科创板融资余额占各自流通市值的比例，>4% 触发风险警示；同步计算交易拥挤度（成交额前5%个股占比，>=45% 风险）；并基于融资净买入趋势（MA20 短期情绪 + 年初至今累计水位）给出阶段顶底信号（偏顶/偏底/中性）。
 
 ## Commands
 
@@ -26,8 +26,9 @@ python3 scripts/leverage_risk.py --json
 python3 scripts/leverage_risk.py --threshold 5.0
 python3 scripts/leverage_risk.py --self-check
 
-# 导出成交额前5%个股到 Excel (剔除银行/煤炭/电力类, 默认 output/crowding_top_{date}.xlsx)
-python3 scripts/leverage_risk.py --export
+# 导出成交额前5%抱团股到 Excel — 默认开启 (剔除银行/煤炭/电力类, 默认 output/crowding_top_{date}.xlsx)
+python3 scripts/leverage_risk.py --no-export          # 关闭默认导出
+python3 scripts/leverage_risk.py --export /tmp/x.xlsx # 指定路径
 ```
 
 ## Architecture
@@ -46,10 +47,15 @@ python3 scripts/leverage_risk.py --export
     └── stock_zh_a_spot (新浪) → 各板块(创业板/科创板/沪深两市)分别计算
         板块内成交额排名前5%个股总成交额 / 该板块成交额
         (新浪接口, 获取失败跳过, 不影响杠杆主体)
+  融资净买入趋势 (断顶底信号, 沪深合计)
+    └── macro_china_market_margin_sh/sz → 沪深融资余额全历史日频
+        净买入(日) = 余额差分 → 蓝线 MA20(短期情绪) + 黑线 年初至今累计(水位)
+        累计创年内新高 → 偏顶; MA20 从负值低谷回升+累计处低位 → 偏底
+        (macro 接口失败跳过, 不影响杠杆主体)
         ↓
   融资余额(元) / 流通市值(亿元×1e8) × 100 = 占比(%)
         ↓
-  占比 > threshold → 风险警示; 拥挤度 >= 45% → 风险警示
+  占比 > threshold → 风险警示; 拥挤度 >= 45% → 风险警示; 净买入趋势 → 顶底信号
 ```
 
 ### 关键设计决策
@@ -61,6 +67,7 @@ python3 scripts/leverage_risk.py --export
 - **板块分类**：按代码前缀。沪市主板取 600/601/603/605（排除 688），深市主板排除 300/301。
 - **默认标的集**：创业板 + 科创板 + 沪深两市。`--symbols` 切换个股模式（融资余额取明细，流通市值取 `stock_zh_a_daily` 收盘价×总股本(新浪)，无东方财富依赖）。
 - **交易拥挤度**：仅全市场模式计算，按板块列示。`stock_zh_a_spot`（新浪）取全市场逐股成交额，按代码前缀分板块后，各板块独立计算前5%成交额占比 >= 45% 标记风险；接口不稳时返回 `None` 跳过，不阻塞杠杆分析。阈值可用 `--crowding-threshold` 调整。
+- **融资净买入趋势（断顶底）**：`macro_china_market_margin_sh/sz` 无参一次返回沪深融资余额全历史日频；**净买入 = 余额差分**（接口只有融资买入额、无偿还额，存量差即流量）。蓝线 MA20（短期情绪）、黑线年初至今累计（水位），用**相对位置**（当前/年内峰值 %）判顶底，避免文档绝对值（−200 亿低谷 / ≈5000 亿峰值）随年份漂移失效。仅全市场模式，个股模式跳过；失败返回 `None` 不阻塞。
 
 ### 数据源可靠性速查
 
@@ -73,6 +80,7 @@ python3 scripts/leverage_risk.py --export
 | `stock_szse_summary(date=)` | 深市流通市值（主板/创业板/合计） | ✅ **带 date 可靠** | **必须带 date 参数**；单位元。无参调用返回异常子集（创业板 69,004 亿，约为真实值一半） |
 | `stock_zh_a_spot` | 全市场逐股成交额（交易拥挤度） | ✅ 可靠 | 新浪全市场行情，含"成交额"列；失败时跳过拥挤度，不阻塞杠杆分析 |
 | `stock_zh_a_daily` | 个股最新收盘价 | ✅ 可靠 | 个股流通市值取价用；末行=最近交易日收盘，时点与融资余额(T+1)匹配 |
+| `macro_china_market_margin_sh/sz` | 沪深融资余额全历史日频（断顶底信号） | ✅ 可靠 | 无参返回全历史；含融资余额/融资买入额；净买入用余额差分（接口无偿还额，存量差即流量）；T+1 更新 |
 
 ### 经验教训
 

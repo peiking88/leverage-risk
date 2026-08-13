@@ -14,8 +14,14 @@
     (spot 实时价开市前为0, 故用日线最近收盘价; 流通占比高时总市值≈流通市值; 无东方财富依赖)
   交易拥挤度: 新浪全市场行情 (stock_zh_a_spot) — 成交额排名前5%个股总成交额 / 全市场成交额
     (ponytail: 新浪接口开市前价格为0但不影响成交额列, 获取失败时跳过拥挤度, 不影响杠杆主体分析)
+  融资净买入趋势 (断顶底信号, 沪深合计):
+    - macro_china_market_margin_sh/sz → 沪深融资余额全历史日频
+    - 净买入(日) = 融资余额差分 (存量差即流量; 接口无偿还额)
+    - 蓝线 净买入MA20 (融资客短期情绪), 黑线 年初至今累计净买入 (杠杆水位趋势)
+    - 累计创年内新高 → 偏顶(买力枯竭); MA20 从负值低谷回升+累计处低位 → 偏底(聪明钱抄底)
+    (macro 接口获取失败跳过, 不影响杠杆主体分析)
 
-风险阈值: 融资余额/流通市值 > 4% 触发警示; 交易拥挤度 >= 45% 触发警示
+风险阈值: 融资余额/流通市值 > 4% 触发警示; 交易拥挤度 >= 45% 触发警示; 净买入趋势给顶底信号
 
 用法:
   python3 leverage_risk.py                            # 默认: 上一交易日, 沪深两市+科创板+创业板
@@ -36,12 +42,15 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-__version__ = "1.6.3"
+__version__ = "1.7.1"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
 CROWDING_THRESHOLD = 45.0  # 成交额前5%个股占比 >= 45% 触发拥挤度警示
 CROWDING_TOP_PCT = 0.05    # 排名前列个股比例
+# 融资净买入趋势 (断顶底信号)
+NETBUY_MA_WINDOW = 20      # 蓝线: 净买入 MA 窗口 (融资客短期情绪)
+NETBUY_LOOKBACK = 60       # 判定 MA20 低谷的回看区间
 # 默认监测标的集: 创业板 + 科创板 + 沪深两市合计
 DEFAULT_SEGMENTS = ["创业板", "科创板", "沪深两市"]
 
@@ -178,6 +187,67 @@ def fetch_live_mv() -> dict | None:
         sz_total = float(sz["股票"]) / 1e8
         return {"创业板": cyb, "科创板": kcb,
                 "沪深两市": sh_total + sz_total, "date": mv_date}
+    except Exception:
+        return None
+
+
+# ---- 融资净买入趋势 (断顶底信号) ----
+def fetch_netbuy_trend(ma_window: int = NETBUY_MA_WINDOW,
+                       lookback: int = NETBUY_LOOKBACK) -> dict | None:
+    """融资净买入趋势 → 阶段顶底信号 (沪深合计)。
+
+    沪深融资余额全历史日频 → 差分得日净买入 → 蓝线 MA20(短期情绪) + 黑线 年初至今累计(水位)。
+    净买入(日) = 融资余额(今) - 融资余额(昨): 存量差即流量 (macro 接口无偿还额, 故用差分)。
+    信号(相对位置, 文档绝对值仅作参考, 不作死阈值):
+      偏顶 — 累计净买入接近/创年内新高 (买力趋于枯竭, 警惕阶段顶)
+      偏底 — 净买入MA20 从负值低谷回升 + 累计净买入尚处年内低位 (聪明钱抄底, 关注阶段底)
+      中性 — 未现极端信号
+    失败返回 None (不阻塞杠杆主体分析)。
+    """
+    try:
+        sh = ak.macro_china_market_margin_sh()[["日期", "融资余额"]]
+        time.sleep(1)
+        sz = ak.macro_china_market_margin_sz()[["日期", "融资余额"]]
+        # 沪深余额合并(元), 按日期对齐求和; 缺失补0 (沪深交易日基本同步)
+        sh["日期"] = pd.to_datetime(sh["日期"])
+        sz["日期"] = pd.to_datetime(sz["日期"])
+        bal = (sh.set_index("日期")["融资余额"]
+               .add(sz.set_index("日期")["融资余额"], fill_value=0)
+               .sort_index())
+        bal = bal[bal > 0]
+        if len(bal) < ma_window + 2:
+            return None
+        netbuy = bal.diff().dropna() / 1e8                      # 日净买入(亿)
+        netbuy_ma = netbuy.rolling(ma_window).mean()
+        year = datetime.now().year
+        ytd = bal[bal.index >= f"{year}-01-01"]
+        cum = (ytd - ytd.iloc[0]) / 1e8                          # 年初至今累计净买入序列(亿)
+
+        ma_now = float(netbuy_ma.iloc[-1])
+        ma_trough = float(netbuy_ma.tail(lookback).min())        # 近N日MA低谷(蓝线谷底)
+        cum_now = float(cum.iloc[-1])
+        cum_max = float(cum.max())                               # 黑线年内峰值
+        pos_at_max = cum_now / cum_max * 100 if cum_max > 0 else 0.0
+
+        is_new_high = cum_max > 0 and cum_now >= cum_max * 0.99  # 累计贴近年内最高
+        ma_rebounding = ma_trough < 0 and ma_now > ma_trough     # MA20 从负值低谷回升
+        if is_new_high or pos_at_max >= 99:
+            signal = "偏顶"
+        elif ma_rebounding and pos_at_max < 30:                  # 谷底回升 + 累计尚处低位
+            signal = "偏底"
+        else:
+            signal = "中性"
+        return {
+            "date": bal.index[-1].strftime("%Y-%m-%d"),
+            "year": year,
+            "ma_window": ma_window,
+            "netbuy_ma": round(ma_now, 2),     # 蓝线当前(亿)
+            "ma_trough": round(ma_trough, 2),  # 近N日MA低谷(亿)
+            "cum_ytd": round(cum_now, 2),      # 黑线当前(亿)
+            "cum_max": round(cum_max, 2),      # 黑线年内峰值(亿)
+            "pos_at_max": round(pos_at_max, 1),# 当前/年内峰值 %
+            "signal": signal,
+        }
     except Exception:
         return None
 
@@ -352,6 +422,8 @@ def analyze(
 
     # 交易拥挤度 (仅全市场模式; 获取失败返回 None, 不影响杠杆分析)
     crowding = fetch_crowding() if not symbols else None
+    # 融资净买入趋势 → 顶底信号 (全市场口径, 个股模式跳过; 失败返回 None)
+    netbuy = fetch_netbuy_trend() if not symbols else None
 
     if symbols:
         for raw in symbols:
@@ -368,6 +440,7 @@ def analyze(
                 add(seg, board_margin.get(seg, 0.0), mv.get(seg), crowding_ratio=cr)
 
     result["crowding"] = crowding  # {板块: {...}} 或 None
+    result["netbuy"] = netbuy      # 净买入趋势 + 顶底信号, 或 None
 
     return result
 
@@ -424,6 +497,24 @@ def format_report(result: dict) -> str:
     else:
         lines.append(f"\n✅ 所有标的均在 {result['threshold']}% 以下，杠杆风险可控。")
 
+    # 融资净买入趋势 (断顶底信号)
+    nb = result.get("netbuy")
+    if nb:
+        icon = {"偏顶": "🔴", "偏底": "🟢", "中性": "⚪"}[nb["signal"]]
+        note = {
+            "偏顶": "累计净买入接近年内高位, 杠杆资金买力趋于枯竭, 警惕阶段顶",
+            "偏底": "净买入MA20从低谷回升且累计净买入尚处低位, 聪明钱逆势进场, 关注阶段底",
+            "中性": "净买入趋势未现极端信号",
+        }[nb["signal"]]
+        lines.append(f"\n📉 融资净买入趋势 (断顶底信号, 沪深合计, 截至 {nb['date']})")
+        lines.append(f"   蓝线 净买入MA{nb['ma_window']}(短期情绪): {nb['netbuy_ma']} 亿"
+                     f"  (近{NETBUY_LOOKBACK}日低谷 {nb['ma_trough']} 亿)")
+        lines.append(f"   黑线 {nb['year']}年初至今累计净买入: {nb['cum_ytd']} 亿"
+                     f"  (年内峰值 {nb['cum_max']} 亿, 当前 {nb['pos_at_max']}%)")
+        lines.append(f"   信号: {icon} {nb['signal']} — {note}")
+    elif not symbols:
+        lines.append("\n融资净买入趋势: 未计算 (新浪宏观接口获取失败)")
+
     lines.append("\n📋 融资余额: AKShare 沪深交易所 (动态, T+1)")
     lines.append(f"   流通市值: {result.get('mv_source', '')} ({result['mv_date']}), 可用 --xxx-mv 覆盖")
     # 个股流通市值来源说明
@@ -451,6 +542,9 @@ def self_check():
     print(f"   流通市值来源: {r['mv_source']} ({r['mv_date']})")
     for it in r["items"]:
         print(f"   {it['name']}: 融资余额 {it['margin_yi']}亿 / 流通市值 {it['circ_mv_yi']:,.0f}亿 = {it['ratio_pct']}%")
+    nb = r.get("netbuy")
+    if nb:
+        print(f"   净买入趋势: MA{nb['ma_window']} {nb['netbuy_ma']}亿 / 累计 {nb['cum_ytd']}亿 (峰值 {nb['cum_max']}亿) → {nb['signal']}")
 
 
 # ---- 入口 ----
@@ -462,9 +556,11 @@ def main():
                         help=f"杠杆风险阈值%% (默认 {RISK_THRESHOLD})")
     parser.add_argument("--crowding-threshold", type=float, default=CROWDING_THRESHOLD,
                         help=f"拥挤度阈值%% (成交额前{int(CROWDING_TOP_PCT*100)}%%个股占比, 默认 {CROWDING_THRESHOLD})")
-    parser.add_argument("--export", nargs="?", const="", metavar="PATH",
-                        help="导出成交额前5%%个股到 Excel (每板块一 sheet, 含名称; "
-                             "不给路径默认 output/crowding_top_{date}.xlsx)")
+    parser.add_argument("--export", nargs="?", const="", default="", metavar="PATH",
+                        help="导出成交额前5%%个股到 Excel (默认开启; 可选路径, 不给则 "
+                             "output/crowding_top_{date}.xlsx; 用 --no-export 关闭)")
+    parser.add_argument("--no-export", action="store_true",
+                        help="关闭默认的成交额前5%%个股 Excel 导出")
     parser.add_argument("--cyb-mv", type=float, help="创业板流通市值(亿元)")
     parser.add_argument("--kcb-mv", type=float, help="科创板流通市值(亿元)")
     parser.add_argument("--total-mv", type=float, help="沪深两市流通市值(亿元)")
@@ -493,7 +589,7 @@ def main():
         print(f"❌ {e}", file=sys.stderr)
         sys.exit(1)
 
-    if args.export is not None:
+    if not args.no_export:
         path = args.export or f"output/crowding_top_{result['date']}.xlsx"
         try:
             path, excluded = export_top_excel(result, path)
