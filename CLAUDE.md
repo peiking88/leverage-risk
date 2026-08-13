@@ -29,6 +29,10 @@ python3 scripts/leverage_risk.py --self-check
 # 导出成交额前5%抱团股到 Excel — 默认开启 (剔除银行/煤炭/电力类, 默认 output/crowding_top_{date}.xlsx)
 python3 scripts/leverage_risk.py --no-export          # 关闭默认导出
 python3 scripts/leverage_risk.py --export /tmp/x.xlsx # 指定路径
+
+# 生成 markdown 监测报告 — 默认开启 (杠杆/拥挤度/净买入/警示/来源; 默认 output/leverage_risk_report_{date}.md; 屏幕输出不受影响)
+python3 scripts/leverage_risk.py --no-report          # 关闭默认 md 报告
+python3 scripts/leverage_risk.py --report /tmp/r.md   # 指定路径
 ```
 
 ## Architecture

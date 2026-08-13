@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-__version__ = "1.7.1"
+__version__ = "1.8.0"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -352,6 +352,103 @@ def export_top_excel(result: dict, path: str) -> tuple[str, int]:
     return path, excluded
 
 
+# ---- Markdown 报告 ----
+def write_md_report(result: dict, path: str) -> str:
+    """生成 markdown 监测报告到文件 (屏幕输出不受影响)。
+
+    内容全部来自 result (确定性数据 + 信号), 不含主观投资建议。
+    返回 path。
+    """
+    th = result["threshold"]
+    cr_th = result.get("crowding_threshold", CROWDING_THRESHOLD)
+
+    def _amt(v):  # 金额(亿) 千分位两位
+        return "N/A" if v is None else f"{v:,.2f}"
+
+    def _pct(v, n=2):  # 百分比 (n=小数位; 占比2位, 拥挤度1位, 与屏幕一致)
+        return "N/A" if v is None else f"{v:.{n}f}%"
+
+    L = ["# 市场杠杆风险监测报告", ""]
+    L.append(f"- 数据日期: {result['date']}（流通市值: {result['mv_date']}, {result.get('mv_source', '')}）")
+    L.append(f"- 风险阈值: 融资余额/流通市值 > {th}%；交易拥挤度 ≥ {cr_th}%")
+    L.append(f"- 生成时间: {result.get('timestamp', '')}")
+    L.append("")
+
+    # 杠杆水位
+    L.append("## 杠杆水位（融资余额 / 流通市值）")
+    L.append("")
+    L.append("| 标的 | 融资余额(亿) | 流通市值(亿) | 占比 | 状态 |")
+    L.append("|------|---:|---:|---:|---|")
+    for it in result["items"]:
+        flag = it.get("is_risk")
+        st = "🔴 风险" if flag is True else ("🟢 安全" if flag is False else "❓")
+        L.append(f"| {it['name']} | {_amt(it.get('margin_yi'))} | {_amt(it.get('circ_mv_yi'))} "
+                 f"| {_pct(it.get('ratio_pct'))} | {st} |")
+    L.append("")
+
+    # 交易拥挤度
+    if any(it.get("crowding_ratio") is not None for it in result["items"]):
+        L.append("## 交易拥挤度（成交额前 5% 个股占比）")
+        L.append("")
+        L.append("| 标的 | 拥挤度 | 状态 |")
+        L.append("|------|---:|---|")
+        for it in result["items"]:
+            cr = it.get("crowding_ratio")
+            if cr is None:
+                continue
+            cst = "🔴 风险" if it.get("crowding_risk") else "🟢 安全"
+            L.append(f"| {it['name']} | {_pct(cr, 1)} | {cst} |")
+        cr_all = (result.get("crowding") or {}).get("沪深两市")
+        if cr_all:
+            L.append("")
+            L.append(f"> 全市场口径: 前 {cr_all['top_n']} 股成交 {cr_all['top_amount_yi']:,.2f} 亿"
+                     f" / 全市场 {cr_all['total_amount_yi']:,.2f} 亿 (共 {cr_all['total_n']} 股)。")
+        L.append("")
+
+    # 融资净买入趋势
+    nb = result.get("netbuy")
+    if nb:
+        L.append("## 融资净买入趋势（断顶底信号，沪深合计）")
+        L.append("")
+        L.append(f"- 🟦 蓝线 净买入 MA{nb['ma_window']}（短期情绪）: {nb['netbuy_ma']} 亿"
+                 f"（近 {NETBUY_LOOKBACK} 日低谷 {nb['ma_trough']} 亿）")
+        L.append(f"- ⬛ 黑线 {nb['year']} 年初至今累计净买入: {nb['cum_ytd']} 亿"
+                 f"（年内峰值 {nb['cum_max']} 亿，当前 {nb['pos_at_max']}%）")
+        _nb_icon = {"偏顶": "🔴", "偏底": "🟢", "中性": "⚪"}.get(nb["signal"], "")
+        L.append(f"- 信号: {_nb_icon} {nb['signal']}")
+        L.append("")
+
+    # 风险警示汇总
+    risks = []
+    for it in result["items"]:
+        if it.get("is_risk"):
+            risks.append(f"{it['name']} 融资占比 {_pct(it.get('ratio_pct'))} > {th}%")
+        if it.get("crowding_risk"):
+            risks.append(f"{it['name']} 拥挤度 {_pct(it.get('crowding_ratio'), 1)} ≥ {cr_th}%")
+    L.append("## 风险警示")
+    L.append("")
+    if risks:
+        for r in risks:
+            L.append(f"- 🔴 {r}")
+    else:
+        L.append(f"- ✅ 所有标的融资占比均在 {th}% 以下，杠杆风险可控。")
+    L.append("")
+
+    # 数据来源
+    L.append("## 数据来源")
+    L.append("")
+    L.append("- 融资余额: AKShare 沪深交易所（动态, T+1）")
+    L.append(f"- 流通市值: {result.get('mv_source', '')}（{result['mv_date']}）")
+    L.append("- 交易拥挤度: 新浪全市场行情 `stock_zh_a_spot`")
+    L.append("- 融资净买入趋势: `macro_china_market_margin_sh/sz`（余额差分）")
+    L.append("")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(L))
+    return path
+
+
 # ---- 标的解析 ----
 def parse_symbol(tok: str) -> str:
     """sh600000 / sz000001 / 600000 → 纯代码。"""
@@ -561,6 +658,11 @@ def main():
                              "output/crowding_top_{date}.xlsx; 用 --no-export 关闭)")
     parser.add_argument("--no-export", action="store_true",
                         help="关闭默认的成交额前5%%个股 Excel 导出")
+    parser.add_argument("--report", nargs="?", const="", default="", metavar="PATH",
+                        help="生成 markdown 监测报告 (默认开启; 可选路径, 不给则 "
+                             "output/leverage_risk_report_{date}.md; 用 --no-report 关闭)")
+    parser.add_argument("--no-report", action="store_true",
+                        help="关闭默认的 markdown 报告生成")
     parser.add_argument("--cyb-mv", type=float, help="创业板流通市值(亿元)")
     parser.add_argument("--kcb-mv", type=float, help="科创板流通市值(亿元)")
     parser.add_argument("--total-mv", type=float, help="沪深两市流通市值(亿元)")
@@ -599,6 +701,14 @@ def main():
             print(msg, file=sys.stderr if args.json else sys.stdout)
         except ValueError as e:
             print(f"⚠️  {e}", file=sys.stderr)
+
+    if not args.no_report:
+        rpath = args.report or f"output/leverage_risk_report_{result['date']}.md"
+        try:
+            rpath = write_md_report(result, rpath)
+            print(f"📝 已生成报告: {rpath}", file=sys.stderr if args.json else sys.stdout)
+        except Exception as e:
+            print(f"⚠️  生成报告失败: {e}", file=sys.stderr)
 
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
