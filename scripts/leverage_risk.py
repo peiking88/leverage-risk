@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-__version__ = "1.8.0"
+__version__ = "1.8.1"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -253,6 +253,9 @@ def fetch_netbuy_trend(ma_window: int = NETBUY_MA_WINDOW,
 
 
 # ---- 交易拥挤度 ----
+_CROWDING_SKIP_REASON: str | None = None  # fetch_crowding 跳过原因, 供提示准确展示
+
+
 def _board_of(code: str) -> str:
     """按代码前缀分类板块 (用于拥挤度分组)。"""
     c = code[2:] if code[:2] in ("sh", "sz", "bj") else code
@@ -271,11 +274,15 @@ def fetch_crowding() -> dict | None:
     含 "创业板"、"科创板"、"沪深两市"(全市场); top_detail = 前5%个股明细 DataFrame
     (代码/名称/板块/成交额(亿)/成交额占比(%), 按成交额降序); 失败返回 None。
     """
+    global _CROWDING_SKIP_REASON
+    _CROWDING_SKIP_REASON = None
     try:
         spot = ak.stock_zh_a_spot()
         df = spot[["代码", "名称", "成交额"]].dropna(subset=["成交额"])
         df = df[df["成交额"] > 0].copy()
         if df.empty:
+            # ponytail: 盘前/收盘后实时接口成交额为0, 非接口故障; 区分提示避免误判排查
+            _CROWDING_SKIP_REASON = "非交易活跃时段，全市场成交额为 0（盘前/收盘后实时接口无成交）"
             return None
         df["board"] = df["代码"].astype(str).map(_board_of)
 
@@ -309,7 +316,8 @@ def fetch_crowding() -> dict | None:
                 out[board] = _calc(sub)
         out["沪深两市"] = _calc(df)  # 沪深两市 = 全市场口径
         return out
-    except Exception:
+    except Exception as e:
+        _CROWDING_SKIP_REASON = f"新浪行情接口获取失败（{type(e).__name__}: {e}）"
         return None
 
 
@@ -333,7 +341,7 @@ def export_top_excel(result: dict, path: str) -> tuple[str, int]:
     """
     crowding = result.get("crowding")
     if not crowding:
-        raise ValueError("无拥挤度数据 (个股模式或新浪行情接口失败), 跳过导出")
+        raise ValueError(f"无拥挤度数据（{result.get('crowding_skip_reason') or '新浪行情接口获取失败'}），跳过导出")
     sheets, excluded = {}, 0
     for b, c in crowding.items():
         d = c.get("top_detail")
@@ -537,6 +545,7 @@ def analyze(
                 add(seg, board_margin.get(seg, 0.0), mv.get(seg), crowding_ratio=cr)
 
     result["crowding"] = crowding  # {板块: {...}} 或 None
+    result["crowding_skip_reason"] = "个股模式不计算拥挤度" if symbols else _CROWDING_SKIP_REASON
     result["netbuy"] = netbuy      # 净买入趋势 + 顶底信号, 或 None
 
     return result
@@ -587,7 +596,7 @@ def format_report(result: dict) -> str:
         lines.append(f"\n📊 拥挤度明细 — 全市场: 前 {cr['top_n']} 股成交额 {cr['top_amount_yi']:,.2f}亿"
                      f" / 全市场 {cr['total_amount_yi']:,.2f}亿 (共 {cr['total_n']} 股)")
     elif not result["items"] or result["items"][0].get("crowding_ratio") is None:
-        lines.append("\n交易拥挤度: 未计算 (个股模式, 或新浪行情接口获取失败)")
+        lines.append(f"\n交易拥挤度: 未计算 ({result.get('crowding_skip_reason') or '新浪行情接口获取失败'})")
 
     if risk_names:
         lines.append(f"\n⚠️  风险警示: {', '.join(risk_names)}")
