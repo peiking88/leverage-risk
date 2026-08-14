@@ -42,7 +42,7 @@ from datetime import datetime, timedelta
 import akshare as ak
 import pandas as pd
 
-__version__ = "1.8.1"
+__version__ = "1.8.2"
 
 # ---- 配置 ----
 RISK_THRESHOLD = 4.0
@@ -382,35 +382,26 @@ def write_md_report(result: dict, path: str) -> str:
     L.append(f"- 生成时间: {result.get('timestamp', '')}")
     L.append("")
 
-    # 杠杆水位
-    L.append("## 杠杆水位（融资余额 / 流通市值）")
+    # 检测结果 — 统一全列表, 与屏幕 format_report 主表列集对齐 (固化格式):
+    # 标的 | 融资余额(亿) | 流通市值(亿) | 占比 | 拥挤度 | 状态
+    # 占比/状态 = 杠杆口径 (🔴/🟢/❓); 拥挤度列带 emoji 区分拥挤风险
+    L.append("## 检测结果")
     L.append("")
-    L.append("| 标的 | 融资余额(亿) | 流通市值(亿) | 占比 | 状态 |")
-    L.append("|------|---:|---:|---:|---|")
+    L.append("| 标的 | 融资余额(亿) | 流通市值(亿) | 占比 | 拥挤度 | 状态 |")
+    L.append("|------|---:|---:|---:|---:|---|")
     for it in result["items"]:
         flag = it.get("is_risk")
         st = "🔴 风险" if flag is True else ("🟢 安全" if flag is False else "❓")
+        cr = it.get("crowding_ratio")
+        cr_str = "N/A" if cr is None else f"{_pct(cr, 1)} {'🔴' if it.get('crowding_risk') else '🟢'}"
         L.append(f"| {it['name']} | {_amt(it.get('margin_yi'))} | {_amt(it.get('circ_mv_yi'))} "
-                 f"| {_pct(it.get('ratio_pct'))} | {st} |")
+                 f"| {_pct(it.get('ratio_pct'))} | {cr_str} | {st} |")
     L.append("")
-
-    # 交易拥挤度
-    if any(it.get("crowding_ratio") is not None for it in result["items"]):
-        L.append("## 交易拥挤度（成交额前 5% 个股占比）")
-        L.append("")
-        L.append("| 标的 | 拥挤度 | 状态 |")
-        L.append("|------|---:|---|")
-        for it in result["items"]:
-            cr = it.get("crowding_ratio")
-            if cr is None:
-                continue
-            cst = "🔴 风险" if it.get("crowding_risk") else "🟢 安全"
-            L.append(f"| {it['name']} | {_pct(cr, 1)} | {cst} |")
-        cr_all = (result.get("crowding") or {}).get("沪深两市")
-        if cr_all:
-            L.append("")
-            L.append(f"> 全市场口径: 前 {cr_all['top_n']} 股成交 {cr_all['top_amount_yi']:,.2f} 亿"
-                     f" / 全市场 {cr_all['total_amount_yi']:,.2f} 亿 (共 {cr_all['total_n']} 股)。")
+    # 拥挤度全市场口径补充 (前 5% 成交额占比的绝对量级)
+    cr_all = (result.get("crowding") or {}).get("沪深两市")
+    if cr_all:
+        L.append(f"> 拥挤度全市场口径: 前 {cr_all['top_n']} 股成交 {cr_all['top_amount_yi']:,.2f} 亿"
+                 f" / 全市场 {cr_all['total_amount_yi']:,.2f} 亿 (共 {cr_all['total_n']} 股)。")
         L.append("")
 
     # 融资净买入趋势
@@ -554,6 +545,8 @@ def analyze(
 # ---- 输出 ----
 def format_report(result: dict) -> str:
     cr_threshold = result.get("crowding_threshold", CROWDING_THRESHOLD)
+    # 检测结果主表列集 (固化格式, 与 write_md_report 检测结果表一致):
+    # 标的 | 融资余额(亿) | 流通市值(亿) | 占比 | 拥挤度 | 状态
     lines = ["=" * 70, "市场杠杆风险监测报告",
              f"数据日期: {result['date']}  (流通市值: {result['mv_date']}, {result.get('mv_source', '')})",
              f"风险阈值: 融资余额/流通市值 > {result['threshold']}%   "
